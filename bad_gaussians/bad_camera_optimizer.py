@@ -210,34 +210,41 @@ class BadCameraOptimizer(CameraOptimizer):
         """Not implemented. Should not be called."""
         raise NotImplementedError("Not implemented in BAD-Gaussians. Please checkout https://github.com/WU-CVGL/Bad-RFs")
 
-    def apply_to_camera(self, camera: Cameras, mode: TrajSamplingMode) -> List[Cameras]:
-        """Apply pose correction to the camera"""
-        # assert camera.metadata is not None, "Must provide camera metadata"
-        # assert "cam_idx" in camera.metadata, "Must provide id of camera in its metadata"
-        if self.config.mode == "off" or camera.metadata is None or not ("cam_idx" in camera.metadata):
-            # print("[WARN] Cannot get cam_idx in camera.metadata")
-            return [deepcopy(camera)]
+    def apply_to_c2w(
+            self,
+            c2w: Float[Tensor, "batch_size 4 4"],
+            camera_ids: Int[Tensor, "batch_size"],
+            mode: TrajSamplingMode = "mid",
+    ) -> Float[Tensor, "batch_size (num_interpolations) 4 4"]:
+        """Apply pose correction to the camera to world matrices."""
+        if self.config.mode == "off":
+            return c2w
 
-        camera_idx = camera.metadata["cam_idx"]
-        c2w = camera.camera_to_worlds  # shape: (1, 4, 4)
         if c2w.shape[1] == 3:
             c2w = torch.cat([c2w, torch.tensor([0, 0, 0, 1], device=c2w.device).view(1, 1, 4)], dim=1)
 
-        poses_delta = self((torch.tensor([camera_idx])), mode)
+        poses_delta = self((torch.tensor(camera_ids)), mode)
 
         if mode == "uniform":
-            c2ws = c2w.tile((self.config.num_virtual_views, 1, 1))  # shape: (num_virtual_views, 4, 4)
-            c2ws_adjusted = torch.bmm(c2ws, poses_delta.matrix().squeeze())
-            cameras_list = [deepcopy(camera) for _ in range(self.config.num_virtual_views)]
-            for i in range(self.config.num_virtual_views):
-                cameras_list[i].camera_to_worlds = c2ws_adjusted[None, i, :, :]
+            # c2w: (..., 4, 4), poses_delta: (..., num_virtual_views, 4, 4)
+            c2ws = c2w.unsqueeze(1).expand(-1, self.config.num_virtual_views, -1, -1)
+            c2ws_adjusted = c2ws @ poses_delta.matrix().squeeze()
+            return c2ws_adjusted  # (..., num_virtual_views, 4, 4)
         else:
-            c2w_adjusted = torch.bmm(c2w, poses_delta.matrix())
-            cameras_list = [deepcopy(camera)]
-            cameras_list[0].camera_to_worlds = c2w_adjusted
+            c2w_adjusted = c2w @ poses_delta.matrix()
+            return c2w_adjusted  # (..., 4, 4)
 
-        assert len(cameras_list)
-        return cameras_list
+    def apply_to_camera(
+            self,
+            camera: Cameras,
+            mode: TrajSamplingMode = "mid",
+    ) -> Float[Tensor, "batch_size (num_interpolations) 4 4"]:
+        """Apply pose correction to the camera to world matrices."""
+
+        c2w = camera.camera_to_worlds
+        camera_id = camera.metadata["cam_idx"]
+        optimized_c2w = self.apply_to_c2w(c2w, camera_id, mode)
+        return optimized_c2w
 
     def get_metrics_dict(self, metrics_dict: dict) -> None:
         """Get camera optimizer metrics"""
