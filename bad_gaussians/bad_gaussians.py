@@ -96,25 +96,26 @@ class BadGaussiansModel(SplatfactoModel):
         self.camera_optimizer: BadCameraOptimizer = self.config.camera_optimizer.setup(
             num_cameras=self.num_train_data, device="cpu"
         )
-        self.strategy = BadDefaultStrategy(
-            prune_opa=self.config.cull_alpha_thresh,
-            grow_grad2d=self.config.densify_grad_thresh,
-            grow_scale3d=self.config.densify_size_thresh,
-            grow_scale2d=self.config.split_screen_size,
-            prune_scale3d=self.config.cull_scale_thresh,
-            prune_scale2d=self.config.cull_screen_size,
-            refine_scale2d_stop_iter=self.config.stop_screen_size_at,
-            refine_start_iter=self.config.warmup_length,
-            refine_stop_iter=self.config.stop_split_at,
-            reset_every=self.config.reset_alpha_every * self.config.refine_every,
-            refine_every=self.config.refine_every,
-            pause_refine_after_reset=self.num_train_data + self.config.refine_every,
-            absgrad=self.config.use_absgrad,
-            revised_opacity=False,
-            verbose=True,
-            num_virtual_views=self.config.camera_optimizer.num_virtual_views,
-        )
-        self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
+        if hasattr(self.config, "strategy") and self.config.strategy == "default":
+            self.strategy = BadDefaultStrategy(
+                prune_opa=self.config.cull_alpha_thresh,
+                grow_grad2d=self.config.densify_grad_thresh,
+                grow_scale3d=self.config.densify_size_thresh,
+                grow_scale2d=self.config.split_screen_size,
+                prune_scale3d=self.config.cull_scale_thresh,
+                prune_scale2d=self.config.cull_screen_size,
+                refine_scale2d_stop_iter=self.config.stop_screen_size_at,
+                refine_start_iter=self.config.warmup_length,
+                refine_stop_iter=self.config.stop_split_at,
+                reset_every=self.config.reset_alpha_every * self.config.refine_every,
+                refine_every=self.config.refine_every,
+                pause_refine_after_reset=self.num_train_data + self.config.refine_every,
+                absgrad=self.config.use_absgrad,
+                revised_opacity=False,
+                verbose=True,
+                num_virtual_views=self.config.camera_optimizer.num_virtual_views,
+            )
+            self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
 
     def forward(
             self,
