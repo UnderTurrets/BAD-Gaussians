@@ -1,25 +1,21 @@
 """
-Pose and Intrinsics Optimizers
+Bundle Adjusted Deblur Camera Optimizer
 """
 
 from __future__ import annotations
 
 import functools
-from copy import deepcopy
-from typing import List, Literal, Optional, Type, Union
+from typing import Literal, Type, Union
 
 import pypose as pp
 import torch
 from dataclasses import dataclass, field
 from jaxtyping import Float, Int
 from pypose import LieTensor
-from torch import Tensor
+from torch import nn, Tensor
 from typing_extensions import assert_never
 
-from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
-from nerfstudio.cameras.cameras import Cameras
-from nerfstudio.cameras.rays import RayBundle
-
+from bad_gaussians.base_config import InstantiateConfig
 from bad_gaussians.spline_functor import (
     bezier_interpolation,
     cubic_bspline_interpolation,
@@ -27,13 +23,12 @@ from bad_gaussians.spline_functor import (
     linear_interpolation_mid,
 )
 
-
 TrajSamplingMode = Literal["uniform", "start", "mid", "end"]
 """How to sample the camera trajectory"""
 
 
 @dataclass
-class BadCameraOptimizerConfig(CameraOptimizerConfig):
+class BadCameraOptimizerConfig(InstantiateConfig):
     """Configuration of BAD-Gaussians camera optimizer."""
 
     _target: Type = field(default_factory=lambda: BadCameraOptimizer)
@@ -62,24 +57,23 @@ class BadCameraOptimizerConfig(CameraOptimizerConfig):
     """Initial perturbation to pose delta on se(3). Must be non-zero to prevent NaNs."""
 
 
-class BadCameraOptimizer(CameraOptimizer):
+class BadCameraOptimizer(nn.Module):
     """Optimization for BAD-Gaussians virtual camera trajectories."""
 
     config: BadCameraOptimizerConfig
+    pose_adjustment: Float[LieTensor, "num_cameras num_control_knots dof"]
 
     def __init__(
-            self,
-            config: BadCameraOptimizerConfig,
-            num_cameras: int,
-            device: Union[torch.device, str],
-            non_trainable_camera_indices: Optional[Int[Tensor, "num_non_trainable_cameras"]] = None,
-            **kwargs,
+        self,
+        config: BadCameraOptimizerConfig,
+        num_cameras: int,
+        device: Union[torch.device, str],
+        **kwargs,
     ) -> None:
-        super().__init__(CameraOptimizerConfig(), num_cameras, device)
+        super().__init__()
         self.config = config
         self.num_cameras = num_cameras
         self.device = device
-        self.non_trainable_camera_indices = non_trainable_camera_indices
         self.dof = 6
         """Degrees of freedom of manifold, i.e. number of dimensions of the tangent space"""
         self.dim = 7
@@ -106,9 +100,9 @@ class BadCameraOptimizer(CameraOptimizer):
         )
 
     def forward(
-            self,
-            indices: Int[Tensor, "camera_indices"],
-            mode: TrajSamplingMode = "mid",
+        self,
+        indices: Int[Tensor, "camera_indices"],
+        mode: TrajSamplingMode = "mid",
     ) -> Float[LieTensor, "camera_indices self.num_control_knots self.dof"]:
         """Indexing into camera adjustments.
 
@@ -128,19 +122,9 @@ class BadCameraOptimizer(CameraOptimizer):
         else:
             indices = indices.int()
             unique_indices, lut = torch.unique(indices, return_inverse=True)
+            # assert torch.logical_and(unique_indices >= 0, unique_indices < self.num_cameras).all()
             camera_opt = self.pose_adjustment[unique_indices].Exp()
             outputs.append(self._interpolate(camera_opt, mode)[lut])
-
-        # Detach non-trainable indices by setting to identity transform
-        if (
-                torch.is_grad_enabled()
-                and self.non_trainable_camera_indices is not None
-                and len(indices) > len(self.non_trainable_camera_indices)
-        ):
-            if self.non_trainable_camera_indices.device != self.pose_adjustment.device:
-                self.non_trainable_camera_indices = self.non_trainable_camera_indices.to(self.pose_adjustment.device)
-            nt = self.non_trainable_camera_indices
-            outputs[0][nt] = outputs[0][nt].clone().detach()
 
         # Return: identity if no transforms are needed, otherwise composite transforms together.
         if len(outputs) == 0:
@@ -148,11 +132,11 @@ class BadCameraOptimizer(CameraOptimizer):
         return functools.reduce(pp.mul, outputs)
 
     def _interpolate(
-            self,
-            camera_opt: Float[LieTensor, "*batch_size self.num_control_knots self.dof"],
-            mode: TrajSamplingMode
+        self,
+        camera_opt: Float[LieTensor, "*batch_size self.num_control_knots self.dof"],
+        sampling_mode: TrajSamplingMode,
     ) -> Float[Tensor, "*batch_size interpolations self.dof"]:
-        if mode == "uniform":
+        if sampling_mode == "uniform":
             u = torch.linspace(
                 start=0,
                 end=1,
@@ -167,91 +151,84 @@ class BadCameraOptimizer(CameraOptimizer):
                 return bezier_interpolation(camera_opt, u)
             else:
                 assert_never(self.config.mode)
-        elif mode == "mid":
+        elif sampling_mode == "mid":
             if self.config.mode == "linear":
                 return linear_interpolation_mid(camera_opt)
             elif self.config.mode == "cubic":
-                return cubic_bspline_interpolation(
-                    camera_opt,
-                    torch.tensor([0.5], device=camera_opt.device)
-                ).squeeze(1)
+                return cubic_bspline_interpolation(camera_opt, torch.tensor([0.5], device=camera_opt.device)).squeeze(1)
             elif self.config.mode == "bezier":
                 return bezier_interpolation(camera_opt, torch.tensor([0.5], device=camera_opt.device)).squeeze(1)
             else:
                 assert_never(self.config.mode)
-        elif mode == "start":
+        elif sampling_mode == "start":
             if self.config.mode == "linear":
                 return camera_opt[..., 0, :]
             elif self.config.mode == "cubic":
-                return cubic_bspline_interpolation(
-                    camera_opt,
-                    torch.tensor([0.0], device=camera_opt.device)
-                ).squeeze(1)
+                return cubic_bspline_interpolation(camera_opt, torch.tensor([0.0], device=camera_opt.device)).squeeze(1)
             elif self.config.mode == "bezier":
                 return bezier_interpolation(camera_opt, torch.tensor([0.0], device=camera_opt.device)).squeeze(1)
             else:
                 assert_never(self.config.mode)
-        elif mode == "end":
+        elif sampling_mode == "end":
             if self.config.mode == "linear":
                 return camera_opt[..., 1, :]
             elif self.config.mode == "cubic":
-                return cubic_bspline_interpolation(
-                    camera_opt,
-                    torch.tensor([1.0], device=camera_opt.device)
-                ).squeeze(1)
+                return cubic_bspline_interpolation(camera_opt, torch.tensor([1.0], device=camera_opt.device)).squeeze(1)
             elif self.config.mode == "bezier":
                 return bezier_interpolation(camera_opt, torch.tensor([1.0], device=camera_opt.device)).squeeze(1)
             else:
                 assert_never(self.config.mode)
         else:
-            assert_never(mode)
+            assert_never(sampling_mode)
 
-    def apply_to_raybundle(self, *args, **kwargs):
-        """Not implemented. Should not be called."""
-        raise NotImplementedError("Not implemented in BAD-Gaussians. Please checkout https://github.com/WU-CVGL/Bad-RFs")
+    def apply_to_cameras(
+        self,
+        c2w: Float[Tensor, "batch_size 4 4"],
+        camera_ids: Int[Tensor, "batch_size"],
+        mode: TrajSamplingMode = "mid",
+    ) -> Float[Tensor, "batch_size (num_interpolations) 4 4"]:
+        """Apply pose correction to the camera to world matrices."""
+        if self.config.mode == "off":
+            return c2w
 
-    def apply_to_camera(self, camera: Cameras, mode: TrajSamplingMode) -> List[Cameras]:
-        """Apply pose correction to the camera"""
-        # assert camera.metadata is not None, "Must provide camera metadata"
-        # assert "cam_idx" in camera.metadata, "Must provide id of camera in its metadata"
-        if self.config.mode == "off" or camera.metadata is None or not ("cam_idx" in camera.metadata):
-            # print("[WARN] Cannot get cam_idx in camera.metadata")
-            return [deepcopy(camera)]
-
-        camera_idx = camera.metadata["cam_idx"]
-        c2w = camera.camera_to_worlds  # shape: (1, 4, 4)
         if c2w.shape[1] == 3:
             c2w = torch.cat([c2w, torch.tensor([0, 0, 0, 1], device=c2w.device).view(1, 1, 4)], dim=1)
 
-        poses_delta = self((torch.tensor([camera_idx])), mode)
+        poses_delta = self((torch.tensor(camera_ids)), mode)
 
         if mode == "uniform":
-            c2ws = c2w.tile((self.config.num_virtual_views, 1, 1))  # shape: (num_virtual_views, 4, 4)
-            c2ws_adjusted = torch.bmm(c2ws, poses_delta.matrix().squeeze())
-            cameras_list = [deepcopy(camera) for _ in range(self.config.num_virtual_views)]
-            for i in range(self.config.num_virtual_views):
-                cameras_list[i].camera_to_worlds = c2ws_adjusted[None, i, :, :]
+            # c2w: (..., 4, 4), poses_delta: (..., num_virtual_views, 4, 4)
+            c2ws = c2w.unsqueeze(1).expand(-1, self.config.num_virtual_views, -1, -1)
+            c2ws_adjusted = c2ws @ poses_delta.matrix().squeeze()
+            return c2ws_adjusted  # (..., num_virtual_views, 4, 4)
         else:
-            c2w_adjusted = torch.bmm(c2w, poses_delta.matrix())
-            cameras_list = [deepcopy(camera)]
-            cameras_list[0].camera_to_worlds = c2w_adjusted
+            c2w_adjusted = c2w @ poses_delta.matrix()
+            return c2w_adjusted  # (..., 4, 4)
 
-        assert len(cameras_list)
-        return cameras_list
+    def get_loss_dict(self, loss_dict: dict) -> None:
+        """Add regularization"""
+        pass
 
     def get_metrics_dict(self, metrics_dict: dict) -> None:
         """Get camera optimizer metrics"""
         if self.config.mode != "off":
             metrics_dict["camera_opt_trajectory_translation"] = (
-                    self.pose_adjustment[:, 1, :3] - self.pose_adjustment[:, 0, :3]).norm()
+                self.pose_adjustment[:, 1, :3] - self.pose_adjustment[:, 0, :3]
+            ).norm()
             metrics_dict["camera_opt_trajectory_rotation"] = (
-                    self.pose_adjustment[:, 1, 3:] - self.pose_adjustment[:, 0, 3:]).norm()
+                self.pose_adjustment[:, 1, 3:] - self.pose_adjustment[:, 0, 3:]
+            ).norm()
             metrics_dict["camera_opt_translation"] = 0
             metrics_dict["camera_opt_rotation"] = 0
             for i in range(self.num_control_knots):
                 metrics_dict["camera_opt_translation"] += self.pose_adjustment[:, i, :3].norm()
                 metrics_dict["camera_opt_rotation"] += self.pose_adjustment[:, i, 3:].norm()
 
-    def get_loss_dict(self, loss_dict: dict) -> None:
-        """Add regularization"""
-        pass
+    def get_param_groups(self, param_groups: dict) -> None:
+        """Get camera optimizer parameters"""
+        camera_opt_params = list(self.parameters())
+        if self.config.mode != "off":
+            assert len(camera_opt_params) > 0
+            param_groups["camera_opt"] = camera_opt_params
+        else:
+            assert len(camera_opt_params) == 0

@@ -3,6 +3,7 @@ SE(3) B-spline trajectory library
 
 Created by lzzhao on 2023.09.19
 """
+
 from __future__ import annotations
 
 import pypose as pp
@@ -16,7 +17,7 @@ _EPS = 1e-6
 
 
 def linear_interpolation_mid(
-        ctrl_knots: Float[LieTensor, "*batch_size 2 7"],
+    ctrl_knots: Float[LieTensor, "*batch_size 2 7"],
 ) -> Float[LieTensor, "*batch_size 7"]:
     """Get the midpoint between batches of two SE(3) poses by linear interpolation.
 
@@ -41,9 +42,9 @@ def linear_interpolation_mid(
 
 
 def linear_interpolation(
-        ctrl_knots: Float[LieTensor, "*batch_size 2 7"],
-        u: Float[Tensor, "interpolations"] | Float[Tensor, "*batch_size interpolations"],
-        enable_eps: bool = False,
+    ctrl_knots: Float[LieTensor, "*batch_size 2 7"],
+    u: Float[Tensor, "interpolations"] | Float[Tensor, "*batch_size interpolations"],
+    enable_eps: bool = False,
 ) -> Float[LieTensor, "*batch_size interpolations 7"]:
     """Linear interpolation between batches of two SE(3) poses.
 
@@ -55,6 +56,7 @@ def linear_interpolation(
     Returns:
         The interpolated poses.
     """
+    assert ctrl_knots.shape[-2] == 2, "Linear interpolation requires 2 control knots."
     start_pose, end_pose = ctrl_knots[..., 0, :], ctrl_knots[..., 1, :]
     batch_size = start_pose.shape[:-1]
     interpolations = u.shape[-1]
@@ -81,9 +83,9 @@ def linear_interpolation(
 
 
 def cubic_bspline_interpolation(
-        ctrl_knots: Float[LieTensor, "*batch_size 4 7"],
-        u: Float[Tensor, "interpolations"] | Float[Tensor, "*batch_size interpolations"],
-        enable_eps: bool = False,
+    ctrl_knots: Float[LieTensor, "*batch_size 4 7"],
+    u: Float[Tensor, "interpolations"] | Float[Tensor, "*batch_size interpolations"],
+    enable_eps: bool = False,
 ) -> Float[LieTensor, "*batch_size interpolations 7"]:
     """Cubic B-spline interpolation with batches of four SE(3) control knots.
 
@@ -95,6 +97,7 @@ def cubic_bspline_interpolation(
     Returns:
         The interpolated poses.
     """
+    assert ctrl_knots.shape[-2] == 4, "Cubic B-spline requires 4 control knots."
     batch_size = ctrl_knots.shape[:-2]
     interpolations = u.shape[-1]
 
@@ -110,49 +113,54 @@ def cubic_bspline_interpolation(
     oos = 1.0 / 6.0  # one over six
 
     # t coefficients
-    coeffs_t = torch.stack([
-        oos - 0.5 * u + 0.5 * uu - oos * uuu,
-        4.0 * oos - uu + 0.5 * uuu,
-        oos + 0.5 * u + 0.5 * uu - 0.5 * uuu,
-        oos * uuu
-    ], dim=-2)
+    coeffs_t = torch.stack(
+        [
+            oos - 0.5 * u + 0.5 * uu - oos * uuu,
+            4.0 * oos - uu + 0.5 * uuu,
+            oos + 0.5 * u + 0.5 * uu - 0.5 * uuu,
+            oos * uuu,
+        ],
+        dim=-2,
+    )
+
+    if coeffs_t.device != ctrl_knots.device:
+        coeffs_t = coeffs_t.to(ctrl_knots.device)
 
     # spline t
     t_t = torch.sum(pp.bvv(coeffs_t, ctrl_knots.translation()), dim=-3)
 
     # q coefficients
-    coeffs_r = torch.stack([
-        5.0 * oos + 0.5 * u - 0.5 * uu + oos * uuu,
-        oos + 0.5 * u + 0.5 * uu - 2 * oos * uuu,
-        oos * uuu
-    ], dim=-2)
+    coeffs_r = torch.stack(
+        [5.0 * oos + 0.5 * u - 0.5 * uu + oos * uuu, oos + 0.5 * u + 0.5 * uu - 2 * oos * uuu, oos * uuu], dim=-2
+    )
+
+    if coeffs_r.device != ctrl_knots.device:
+        coeffs_r = coeffs_r.to(ctrl_knots.device)
 
     # spline q
     q_adjacent = ctrl_knots[..., :-1, :].rotation().Inv() @ ctrl_knots[..., 1:, :].rotation()
     r_adjacent = q_adjacent.Log()
     q_ts = pp.Exp(pp.so3(pp.bvv(coeffs_r, r_adjacent)))
     q0 = ctrl_knots[..., 0, :].rotation()  # (*batch_size, 4)
-    q_ts = torch.cat([
-        q0.unsqueeze(-2).tile((interpolations, 1)).unsqueeze(-3),
-        q_ts
-    ], dim=-3)  # (*batch_size, num_ctrl_knots=4, interpolations, 4)
+    q_ts = torch.cat(
+        [q0.unsqueeze(-2).tile((interpolations, 1)).unsqueeze(-3), q_ts], dim=-3
+    )  # (*batch_size, num_ctrl_knots=4, interpolations, 4)
     q_t = pp.cumprod(q_ts, dim=-3, left=False)[..., -1, :, :]
 
     ret = pp.SE3(torch.cat([t_t, q_t], dim=-1))
     return ret
 
-def bezier_interpolation(
-        ctrl_knots: Float[LieTensor, "*batch_size order 7"],
-        u: Float[Tensor, "interpolations"] | Float[Tensor, "*batch_size interpolations"],
-        enable_eps: bool = False,
-) -> Float[LieTensor, "*batch_size interpolations 7"]:
-    """Bezier interpolation with batches of SE(3) control knots.
 
+def bezier_interpolation(
+    ctrl_knots: Float[LieTensor, "*batch_size order 7"],
+    u: Float[Tensor, "interpolations"] | Float[Tensor, "*batch_size interpolations"],
+    enable_eps: bool = False,
+) -> Float[LieTensor, "*batch_size interpolations 7"]:
+    """Bezier interpolation with batches of four SE(3) control knots.
     Args:
         ctrl_knots: The control knots.
         u: Normalized positions on the trajectory segments. Range: [0, 1].
         enable_eps: Whether to clip the normalized position with a small epsilon to avoid possible numerical issues.
-
     Returns:
         The interpolated poses.
     """
@@ -169,15 +177,23 @@ def bezier_interpolation(
     if enable_eps:
         u = torch.clip(u, _EPS, 1.0 - _EPS)
 
-    # Build coefficient matrix. TODO: precompute the coefficients.
+    # Build coefficient matrix.
     bezier_coeffs = []
     for i in range(order):
         coeff_i = binomial_coeffs[i] * pow(1 - u, degree - i) * pow(u, i)
         bezier_coeffs.append(coeff_i)
-    bezier_coeffs = torch.stack(bezier_coeffs, dim=1).float().to(ctrl_knots.device)  # (*batch_size, order, interpolations)
+    bezier_coeffs = (
+        torch.stack(bezier_coeffs, dim=1).float().to(ctrl_knots.device)
+    )  # (*batch_size, order, interpolations)
 
     # (*batch_size, order, interpolations, 7)
     weighted_ctrl_knots = pp.se3(bezier_coeffs.unsqueeze(-1) * ctrl_knots.Log().unsqueeze(-2)).Exp()
     ret = pp.cumprod(weighted_ctrl_knots, dim=-3, left=False)[..., -1, :, :]
 
     return ret
+
+
+if __name__ == "__main__":
+    u = torch.linspace(start=0, end=1, steps=10)
+    poses = pp.randn_se3(1, 5)
+    interpolated_pose = linear_interpolation(poses.Exp(), u)
