@@ -246,6 +246,19 @@ def apply_depth_colormap(
         img = img * acc + (1.0 - acc)
     return img
 
+def save_to_kitti_format(poses, output_file):
+    """
+    Save poses to KITTI format for evo evaluation.
+    :param poses: List of 4x4 numpy arrays representing poses
+    :param output_file: File path to save the poses
+    """
+    with open(output_file, 'w') as f:
+        for pose in poses:
+            if pose.dim()==3:
+                pose=pose.squeeze(0)
+            # Flatten the rotation and translation parts into a single line
+            kitti_format = pose[:3, :].flatten()  # Extract top 3 rows (r11..r33 and tx, ty, tz)
+            f.write(" ".join(f"{value:.6f}" for value in kitti_format) + "\n")
 
 if __name__ == "__main__":
     # test PoseOptModule

@@ -41,6 +41,7 @@ from utils import (
     AppearanceOptModule,
     CameraOptModuleSE3,
     set_random_seed,
+    save_to_kitti_format
 )
 
 
@@ -48,15 +49,15 @@ from utils import (
 class DeblurConfig(Config):
     # Path to the Mip-NeRF 360 dataset
     # data_dir: str = "data/360_v2/garden"
-    data_dir: str = "/datasets/bad-gaussian/data/bad-nerf-gtK-colmap-nvs/blurtanabata"
+    data_dir: str = rf"{os.path.dirname(__file__)}/datasets/lego"
 
     # Downsample factor for the dataset
-    data_factor: int = 1
+    data_factor: int = 4
     # How much to scale the camera origins by. 0.25 is suggested for LLFF scenes.
     scale_factor: float = 1.0
     # Directory to save results
     # result_dir: str = "results/garden"
-    result_dir: str = "results/tanabata_fused-ssim"
+    result_dir: str = rf"{os.path.dirname(__file__)}/results/lego4_Noise1e-4"
     # Every N images there is a test image
     test_every: int = 8
 
@@ -96,7 +97,7 @@ class DeblurConfig(Config):
     )
 
     ########### Camera Opt ###############
-
+    pose_opt: bool = True
     # Learning rate for camera optimization
     pose_opt_lr: float = 1e-3
     # Regularization for camera optimization as weight decay
@@ -104,7 +105,7 @@ class DeblurConfig(Config):
     # Learning rate decay rate of camera optimization
     pose_opt_lr_decay: float = 1e-3
     # Add noise to camera extrinsics. This is only to test the camera pose optimization.
-    pose_noise: float = 1e-5
+    pose_noise: float = 1e-4
     # Pose gradient accumulation steps
     pose_gradient_accumulation_steps: int = 25
 
@@ -182,6 +183,9 @@ class DeblurRunner(Runner):
         os.makedirs(self.stats_dir, exist_ok=True)
         self.render_dir = f"{cfg.result_dir}/renders"
         os.makedirs(self.render_dir, exist_ok=True)
+        if self.cfg.pose_opt:
+            self.poses_dir = f"{cfg.result_dir}/poses"
+            os.makedirs(self.poses_dir, exist_ok=True)
 
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
@@ -251,6 +255,10 @@ class DeblurRunner(Runner):
         ]
         if world_size > 1:
             self.camera_optimizer = DDP(self.camera_optimizer)
+
+        if cfg.pose_noise:
+            self.pose_perturb = CameraOptModuleSE3(len(self.trainset)).to(self.device)
+            self.pose_perturb.random_init(cfg.pose_noise)
 
         self.app_optimizers = []
         if cfg.app_opt:
@@ -367,6 +375,18 @@ class DeblurRunner(Runner):
         if cfg.visualize_cameras:
             self._init_viewer_state()
 
+        # get init poses from dataset and pose_perturb
+        if self.cfg.pose_opt:
+            init_poses = []
+            groundtruth_poses = []
+            for data in self.trainset:
+                groundtruth_pose = data["camtoworld"].to(device).unsqueeze(0)
+                init_pose = self.pose_perturb(groundtruth_pose, torch.tensor(data=[data["image_id"]],device=device))
+                init_poses.append(init_pose)
+                groundtruth_poses.append(groundtruth_pose)
+            save_to_kitti_format(init_poses, f"{self.poses_dir}/init_poses.txt")
+            save_to_kitti_format(groundtruth_poses, f"{self.poses_dir}/groundtruth_poses.txt")
+
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
@@ -394,6 +414,11 @@ class DeblurRunner(Runner):
 
             height, width = pixels.shape[1:3]
 
+            # add noise
+            if cfg.pose_noise:
+                camtoworlds = self.pose_perturb(camtoworlds, image_ids)
+
+            # get optimized pose
             assert camtoworlds.shape[0] == 1
             camtoworlds = self.camera_optimizer.apply_to_cameras(camtoworlds, image_ids, "uniform")[
                 0
@@ -637,6 +662,17 @@ class DeblurRunner(Runner):
                 self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+
+        # get optimized poses from dataset and camera_optimizer
+        if self.cfg.pose_opt:
+            optimized_poses = []
+            for data in self.trainset:
+                init_pose = self.pose_perturb(camtoworlds=data["camtoworld"].to(device).unsqueeze(0),embed_ids=torch.tensor(data=[data["image_id"]],device=device))
+                optimized_pose = self.camera_optimizer.apply_to_cameras(init_pose, torch.tensor(data["image_id"],device=device), "uniform")[
+                0
+                ]  # [num_virt_views, 4, 4]
+                optimized_poses.append(optimized_pose)
+            save_to_kitti_format(optimized_poses, f"{self.poses_dir}/optimized_poses.txt")
 
     @torch.no_grad()
     def eval_deblur(self, step: int, stage: str, dataset: Dataset):
